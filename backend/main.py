@@ -2,7 +2,7 @@ from pathlib import Path
 import os
 
 import psycopg
-import redis
+from upstash_redis import Redis
 
 from psycopg.rows import dict_row
 from dotenv import load_dotenv
@@ -62,21 +62,17 @@ def get_connection():
 # REDIS CONFIG
 # =========================================================
 
-REDIS_URL = os.getenv("REDIS_URL")
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
 redis_client = None
 
-if REDIS_URL:
+if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
     try:
-        REDIS_URL = REDIS_URL.strip().strip('"').strip("'")
-
-        redis_client = redis.from_url(
-            REDIS_URL,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=5,
+        redis_client = Redis(
+            url=UPSTASH_REDIS_REST_URL.strip(),
+            token=UPSTASH_REDIS_REST_TOKEN.strip(),
         )
-
     except Exception as exc:
         print("REDIS CONFIG ERROR TYPE:", type(exc).__name__)
         print("REDIS CONFIG ERROR MESSAGE:", str(exc))
@@ -163,7 +159,7 @@ def health():
 
     try:
         if redis_client is None:
-            raise RuntimeError("Redis client is not configured")
+            raise RuntimeError("Upstash Redis client is not configured")
 
         redis_client.ping()
         redis_status = "connected"

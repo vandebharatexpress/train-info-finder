@@ -2,20 +2,32 @@ from pathlib import Path
 import os
 
 import psycopg
+import redis
+
 from psycopg.rows import dict_row
 from dotenv import load_dotenv
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 
 # =========================================================
-# PROJECT / DATABASE CONFIG
+# PROJECT / ENVIRONMENT CONFIG
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 load_dotenv(BASE_DIR / ".env")
 
+
+# =========================================================
+# POSTGRESQL CONFIG
+# =========================================================
+
+# Railway / Neon connection string
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Fallback for local development
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
     "port": os.getenv("DB_PORT"),
@@ -27,20 +39,77 @@ DB_CONFIG = {
 
 
 def get_connection():
+    """
+    Prefer DATABASE_URL on Railway/Neon.
+    Fall back to separate DB_* variables locally.
+    """
+
+    if DATABASE_URL:
+        return psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=5,
+        )
+
     return psycopg.connect(
         **DB_CONFIG,
-        row_factory=dict_row
+        row_factory=dict_row,
+        connect_timeout=5,
     )
 
 
-app = FastAPI()
+# =========================================================
+# REDIS CONFIG
+# =========================================================
 
+REDIS_URL = os.getenv("REDIS_URL")
+
+if REDIS_URL:
+    redis_client = redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+    )
+else:
+    redis_client = redis.Redis(
+        host=os.getenv("REDIS_HOST", "127.0.0.1"),
+        port=int(os.getenv("REDIS_PORT", "6380")),
+        username=os.getenv("REDIS_USERNAME"),
+        password=os.getenv("REDIS_PASSWORD"),
+        db=0,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+    )
+
+
+# =========================================================
+# FASTAPI APPLICATION
+# =========================================================
+
+app = FastAPI(
+    title="Train Info Finder API",
+    version="1.0.0",
+    description="Backend API for RailSync / Train Info Finder",
+)
+
+
+# =========================================================
+# CORS
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        # React development
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+
+        # Capacitor Android
+        "http://localhost",
+        "https://localhost",
+        "capacitor://localhost",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -48,13 +117,73 @@ app.add_middleware(
 )
 
 
+# =========================================================
+# HOME
+# =========================================================
+
 @app.get("/")
 def home():
     return {
         "message": "Train Info Finder API is running",
-        "database": "PostgreSQL"
+        "database": "PostgreSQL",
+        "cache": "Redis",
+        "docs": "/docs",
+        "health": "/health",
     }
 
+
+# =========================================================
+# HEALTH CHECK
+# =========================================================
+
+@app.get("/health")
+def health():
+    database_status = "disconnected"
+    redis_status = "disconnected"
+
+    # -------------------------
+    # PostgreSQL health
+    # -------------------------
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+
+        database_status = "connected"
+
+    except Exception as exc:
+        # Error will appear in Railway logs
+        print("DATABASE HEALTH ERROR:", repr(exc))
+
+    # -------------------------
+    # Redis health
+    # -------------------------
+
+    try:
+        redis_client.ping()
+        redis_status = "connected"
+
+    except Exception as exc:
+        # Redis isn't configured yet, so this may fail for now
+        print("REDIS HEALTH ERROR:", repr(exc))
+
+    return {
+        "status": (
+            "ok"
+            if database_status == "connected"
+            else "error"
+        ),
+        "api": "running",
+        "database": database_status,
+        "redis": redis_status,
+    }
+
+
+# =========================================================
+# TRAIN LOOKUP
+# =========================================================
 
 @app.get("/train/{train_number}")
 def get_train(train_number: str):
@@ -62,8 +191,9 @@ def get_train(train_number: str):
 
     with get_connection() as conn:
         with conn.cursor() as cursor:
+
             cursor.execute(
-                '''
+                """
                 SELECT
                     number,
                     name,
@@ -76,8 +206,8 @@ def get_train(train_number: str):
                     num_stops
                 FROM trains
                 WHERE number = %s
-                ''',
-                (train_number,)
+                """,
+                (train_number,),
             )
 
             train = cursor.fetchone()
@@ -85,11 +215,11 @@ def get_train(train_number: str):
             if train is None:
                 raise HTTPException(
                     status_code=404,
-                    detail="Train not found"
+                    detail="Train not found",
                 )
 
             cursor.execute(
-                '''
+                """
                 SELECT
                     seq,
                     station_code,
@@ -101,8 +231,8 @@ def get_train(train_number: str):
                 FROM stops
                 WHERE train_number = %s
                 ORDER BY seq
-                ''',
-                (train_number,)
+                """,
+                (train_number,),
             )
 
             route_rows = cursor.fetchall()
@@ -110,19 +240,21 @@ def get_train(train_number: str):
     route_data = []
 
     for stop in route_rows:
-        route_data.append({
-            "seq": stop["seq"],
-            "station_code": stop["station_code"],
-            "station_name": stop["station_name"],
-            "arrival": stop["arrival"],
-            "departure": stop["departure"],
-            "day": stop["day"],
-            "distance_km": (
-                float(stop["distance_km"])
-                if stop["distance_km"] is not None
-                else None
-            )
-        })
+        route_data.append(
+            {
+                "seq": stop["seq"],
+                "station_code": stop["station_code"],
+                "station_name": stop["station_name"],
+                "arrival": stop["arrival"],
+                "departure": stop["departure"],
+                "day": stop["day"],
+                "distance_km": (
+                    float(stop["distance_km"])
+                    if stop["distance_km"] is not None
+                    else None
+                ),
+            }
+        )
 
     return {
         "number": train["number"],
@@ -138,9 +270,13 @@ def get_train(train_number: str):
         ),
         "travel_time": train["travel_time"],
         "num_stops": train["num_stops"],
-        "route": route_data
+        "route": route_data,
     }
 
+
+# =========================================================
+# STATION SEARCH
+# =========================================================
 
 @app.get("/stations/search")
 def search_stations(q: str):
@@ -153,8 +289,9 @@ def search_stations(q: str):
 
     with get_connection() as conn:
         with conn.cursor() as cursor:
+
             cursor.execute(
-                '''
+                """
                 SELECT
                     code,
                     name
@@ -171,13 +308,13 @@ def search_stations(q: str):
                     name NULLS LAST,
                     code
                 LIMIT 10
-                ''',
+                """,
                 (
                     search_pattern,
                     search_pattern,
                     f"{q}%",
-                    f"{q}%"
-                )
+                    f"{q}%",
+                ),
             )
 
             results = cursor.fetchall()
@@ -185,11 +322,19 @@ def search_stations(q: str):
     return [
         {
             "code": row["code"],
-            "name": row["name"] if row["name"] is not None else row["code"]
+            "name": (
+                row["name"]
+                if row["name"] is not None
+                else row["code"]
+            ),
         }
         for row in results
     ]
 
+
+# =========================================================
+# STATION DETAILS
+# =========================================================
 
 @app.get("/station/{station_code}")
 def get_station(station_code: str):
@@ -197,15 +342,16 @@ def get_station(station_code: str):
 
     with get_connection() as conn:
         with conn.cursor() as cursor:
+
             cursor.execute(
-                '''
+                """
                 SELECT
                     code,
                     name
                 FROM stations
                 WHERE UPPER(code) = %s
-                ''',
-                (station_code,)
+                """,
+                (station_code,),
             )
 
             station = cursor.fetchone()
@@ -213,11 +359,11 @@ def get_station(station_code: str):
             if station is None:
                 raise HTTPException(
                     status_code=404,
-                    detail="Station not found"
+                    detail="Station not found",
                 )
 
             cursor.execute(
-                '''
+                """
                 SELECT
                     x.number,
                     x.name,
@@ -248,8 +394,8 @@ def get_station(station_code: str):
                 ) AS x
                 ORDER BY
                     x.number
-                ''',
-                (station_code,)
+                """,
+                (station_code,),
             )
 
             train_rows = cursor.fetchall()
@@ -257,16 +403,18 @@ def get_station(station_code: str):
     trains_here = []
 
     for row in train_rows:
-        trains_here.append({
-            "number": row["number"],
-            "name": row["name"],
-            "type": row["type_label"],
-            "source": row["source"],
-            "destination": row["destination"],
-            "arrival": row["arrival"],
-            "departure": row["departure"],
-            "day": row["day"]
-        })
+        trains_here.append(
+            {
+                "number": row["number"],
+                "name": row["name"],
+                "type": row["type_label"],
+                "source": row["source"],
+                "destination": row["destination"],
+                "arrival": row["arrival"],
+                "departure": row["departure"],
+                "day": row["day"],
+            }
+        )
 
     return {
         "station_code": station["code"],
@@ -276,5 +424,5 @@ def get_station(station_code: str):
             else station["code"]
         ),
         "train_count": len(trains_here),
-        "trains": trains_here
+        "trains": trains_here,
     }

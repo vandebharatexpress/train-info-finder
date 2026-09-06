@@ -64,24 +64,24 @@ def get_connection():
 
 REDIS_URL = os.getenv("REDIS_URL")
 
+redis_client = None
+
 if REDIS_URL:
-    redis_client = redis.from_url(
-        REDIS_URL,
-        decode_responses=True,
-        socket_connect_timeout=3,
-        socket_timeout=3,
-    )
-else:
-    redis_client = redis.Redis(
-        host=os.getenv("REDIS_HOST", "127.0.0.1"),
-        port=int(os.getenv("REDIS_PORT", "6380")),
-        username=os.getenv("REDIS_USERNAME"),
-        password=os.getenv("REDIS_PASSWORD"),
-        db=0,
-        decode_responses=True,
-        socket_connect_timeout=3,
-        socket_timeout=3,
-    )
+    try:
+        REDIS_URL = REDIS_URL.strip().strip('"').strip("'")
+
+        redis_client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+        )
+
+    except Exception as exc:
+        print("REDIS CONFIG ERROR TYPE:", type(exc).__name__)
+        print("REDIS CONFIG ERROR MESSAGE:", str(exc))
+        print("REDIS CONFIG ERROR ARGS:", exc.args)
+        redis_client = None
 
 
 # =========================================================
@@ -162,12 +162,16 @@ def health():
     # -------------------------
 
     try:
+        if redis_client is None:
+            raise RuntimeError("Redis client is not configured")
+
         redis_client.ping()
         redis_status = "connected"
 
     except Exception as exc:
-        # Redis isn't configured yet, so this may fail for now
-        print("REDIS HEALTH ERROR:", repr(exc))
+        print("REDIS HEALTH ERROR TYPE:", type(exc).__name__)
+        print("REDIS HEALTH ERROR MESSAGE:", str(exc))
+        print("REDIS HEALTH ERROR ARGS:", exc.args)
 
     return {
         "status": (

@@ -1,0 +1,11 @@
+{
+  "appId": "com.aamir.railsync",
+  "appName": "RailSync",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": true
+  },
+  "server": {
+    "cleartext": true
+  }
+}
